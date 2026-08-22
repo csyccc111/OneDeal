@@ -1,0 +1,75 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+
+# database & uploads
+/data
+/uploads
+
+# local AI tooling environments
+.agents/
+.claude/
+.windsurf/
+skills-lock.json
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+/app/generated/prisma
+
+# ============ 内部文档与用户数据（不对外开源） ============
+/方案.md
+/开发Prompt.md
+/PROJECT_MEMORY.md
+/部署指南.md
+/隧道搭建指南.md
+/使用指南.md
+/使用指南.docx
+/主机修复任务-*.md
+/任务Prompt-*.md
+/WxPusher操作指南.md
+/主机-仓库差异比对报告.md
+/AGENTS.md
+/CLAUDE.md
+/docs-build/
+/演示文件夹/
+/*.xls
+/*.xlsx
+/*.et
+/*.docx

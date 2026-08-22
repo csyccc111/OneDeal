@@ -1,0 +1,339 @@
+// OneDeal 订单追踪系统 · 数据模型 v2（Phase 1）
+// 约定：
+// - 所有金额字段以 Cents 结尾，单位为「分」（整数），UI 层换算为元显示
+// - SQLite 不支持 Prisma enum，枚举字段用 String 存储中文值，取值约束见 lib/constants.ts
+// - 状态机：待确认 → 排产 → 生产中 → 已发货 → 已结算（不可跳步/回退，由业务层校验）
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ==================== 客户 ====================
+
+model Customer {
+  id           Int      @id @default(autoincrement())
+  name         String   // 客户名
+  contact      String?  // 联系人
+  phone        String?  // 电话
+  wechatRemark String?  // 微信备注
+  settleMode   String   @default("现金") // 结算方式：现金 / 月结
+  creditDays   Int      @default(0) // 账期天数（月结时使用）
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  statementTemplateId Int? // 对账单预设（可空=默认预设，P16）
+
+  statementTemplate StatementTemplate? @relation(fields: [statementTemplateId], references: [id], onDelete: Restrict)
+
+  orders   Order[]
+  payments Payment[]
+  deliveryNotes DeliveryNote[]
+
+  @@unique([name])
+  @@index([settleMode])
+}
+
+// ==================== 订单 ====================
+
+model Order {
+  id              Int       @id @default(autoincrement())
+  orderNo         String    @unique // 单号 YYYYMMDD-序号（如 20260818-001）
+  customerOrderNo String? // 客户订单号（客户侧单号，对账单列，可空）
+  customerId      Int
+  taxType      String    @default("无") // 含税类型：含税 / 不含税 / 无
+  taxRateBp    Int? // 税率（万分比，如 13.5% → 1350），含税时可自定义填写，仅记录不参与金额计算
+  dueDate      DateTime? // 交期
+  status       String    @default("待确认") // 待确认/排产/生产中/已发货/已结算
+  cancelledAt  DateTime? // 作废时间（非空=已作废，留痕不物理删除）
+  cancelReason String? // 作废原因（作废时必填）
+  remark       String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  customer    Customer           @relation(fields: [customerId], references: [id])
+  items       OrderItem[]
+  shipments   Shipment[]
+  statusLogs  OrderStatusLog[]
+  changeLogs  ChangeLog[]
+  attachments Attachment[]
+  allocations PaymentAllocation[]
+  invoices    Invoice[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id             Int    @id @default(autoincrement())
+  orderId        Int
+  itemCode       String? // 物料编号（可空）
+  product        String // 品名
+  spec           String? // 规格/图号
+  unit           String @default("件") // 单位：件/套/公斤…
+  qty            Int    @default(1) // 计划数量
+  unitPriceMills Int    @default(0) // 单价（厘/毫元，1元=1000厘；支持3位小数，如0.105元=105）
+  amountCents    Int    @default(0) // 小计 = round(qty × unitPriceMills ÷ 10)（分）
+  shippedQty     Int    @default(0) // 已发数
+  returnedQty    Int    @default(0) // 退数
+  defectiveQty   Int    @default(0) // 废品数
+  deliveryNoteQty Int   @default(0) // 已生成送货单数量（开单累加、删单回退，防重复开单）
+  note           String?
+
+  order    Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  shipments Shipment[]
+
+  @@index([orderId])
+}
+
+// ==================== 发货 / 退货记录 ====================
+
+model Shipment {
+  id        Int      @id @default(autoincrement())
+  orderId   Int
+  itemId    Int
+  type      String   // 发货 / 退货
+  qty       Int
+  shippedAt DateTime @default(now()) // 发货/退货日期（默认今天）
+  note      String?
+
+  order Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  item  OrderItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([itemId])
+}
+
+// ==================== 状态流转 / 变更日志 ====================
+
+model OrderStatusLog {
+  id         Int      @id @default(autoincrement())
+  orderId    Int
+  fromStatus String? // 空 = 初始创建
+  toStatus   String
+  note       String?
+  changedAt  DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+model ChangeLog {
+  id        Int      @id @default(autoincrement())
+  orderId   Int
+  field     String // 变更字段（如 unitPriceMills、qty）
+  oldValue  String?
+  newValue  String?
+  changedAt DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+// ==================== 附件 ====================
+
+model Attachment {
+  id         Int      @id @default(autoincrement())
+  orderId    Int
+  fileName   String // 原始文件名
+  filePath   String // 相对路径 uploads/<orderNo>/<随机名>
+  fileType   String  @default("其他") // 截图 / 图纸 / 其他
+  uploadedAt DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+// ==================== 收款与分配 ====================
+
+model Payment {
+  id          Int      @id @default(autoincrement())
+  customerId  Int
+  amountCents Int // 收款金额（分）
+  method      String   @default("现金") // 现金 / 转账 / 承兑
+  paidAt      DateTime @default(now())
+  remark      String?
+
+  customer    Customer           @relation(fields: [customerId], references: [id])
+  allocations PaymentAllocation[]
+
+  @@index([customerId])
+  @@index([paidAt])
+}
+
+model PaymentAllocation {
+  id          Int  @id @default(autoincrement())
+  paymentId   Int
+  orderId     Int
+  amountCents Int // 分配冲抵金额（分）
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([paymentId, orderId])
+  @@index([orderId])
+}
+
+// ==================== 开票 ====================
+
+model Invoice {
+  id          Int      @id @default(autoincrement())
+  orderId     Int
+  invoiceNo   String // 票号
+  amountCents Int // 开票金额（分）
+  invoiceDate DateTime @default(now())
+  remark      String?
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceNo])
+  @@index([orderId])
+}
+
+// ==================== 供应商（二期，与客户侧对称） ====================
+
+model Supplier {
+  id         Int      @id @default(autoincrement())
+  name       String // 供应商名
+  contact    String? // 联系人
+  phone      String? // 电话
+  settleMode String   @default("现金") // 结算方式：现金 / 月结
+  creditDays Int      @default(0) // 账期天数（月结时使用）
+  remark     String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  purchaseOrders  PurchaseOrder[]
+  supplierPayments SupplierPayment[]
+
+  @@unique([name])
+  @@index([settleMode])
+}
+
+model PurchaseOrder {
+  id         Int       @id @default(autoincrement())
+  poNo       String    @unique // 采购单号 P+YYYYMMDD-序号（如 P20260818-001）
+  supplierId Int
+  poDate     DateTime  @default(now()) // 采购日期
+  remark     String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  supplier  Supplier                 @relation(fields: [supplierId], references: [id])
+  items     PurchaseItem[]
+  allocations SupplierPaymentAllocation[]
+
+  @@index([supplierId])
+  @@index([poDate])
+}
+
+model PurchaseItem {
+  id             Int    @id @default(autoincrement())
+  poId           Int
+  product        String // 品名
+  spec           String? // 规格/图号
+  unit           String @default("件") // 单位
+  qty            Int    @default(1) // 数量
+  unitPriceMills Int    @default(0) // 单价（厘，1元=1000厘，支持3位小数）
+  amountCents    Int    @default(0) // 小计 = round(qty × unitPriceMills ÷ 10)（分）
+  note           String?
+
+  purchaseOrder PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+
+  @@index([poId])
+}
+
+model SupplierPayment {
+  id          Int      @id @default(autoincrement())
+  supplierId  Int
+  amountCents Int // 付款金额（分）
+  method      String   @default("现金") // 现金 / 转账 / 承兑
+  paidAt      DateTime @default(now())
+  remark      String?
+
+  supplier  Supplier                 @relation(fields: [supplierId], references: [id])
+  allocations SupplierPaymentAllocation[]
+
+  @@index([supplierId])
+  @@index([paidAt])
+}
+
+model SupplierPaymentAllocation {
+  id          Int  @id @default(autoincrement())
+  paymentId   Int
+  poId        Int
+  amountCents Int // 冲抵采购单金额（分）
+
+  payment SupplierPayment   @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  purchaseOrder PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+
+  @@unique([paymentId, poId])
+  @@index([poId])
+}
+
+// ==================== 送货单（二期 P14，复刻用户模板 241×219mm 一联） ====================
+
+model DeliveryNote {
+  id           Int       @id @default(autoincrement())
+  noteNo       String    @unique // 单号 XS-YYYYMMDD-序号（如 XS-20260802-001）
+  customerId   Int
+  noteDate     DateTime  @default(now()) // 送货日期
+  contact      String? // 联系人（可空，默认取客户）
+  address      String? // 客户地址（可空，留空可填）
+  remark       String?
+  printedCount Int       @default(0) // 打印次数
+  createdAt    DateTime  @default(now())
+
+  customer Customer            @relation(fields: [customerId], references: [id])
+  items    DeliveryNoteItem[]
+
+  @@index([customerId])
+  @@index([noteDate])
+}
+
+model DeliveryNoteItem {
+  id              Int     @id @default(autoincrement())
+  noteId          Int
+  orderItemId     Int // 来源订单行（快照不随其变化，仅留来源）
+  orderId         Int
+  orderNo         String // 订单号快照
+  customerOrderNo String? // 客户订单号快照（打印页展示用，可空）
+  itemCode        String? // 物料编号快照
+  product         String // 品名快照
+  spec            String? // 规格快照
+  unit            String // 单位快照
+  qty             Int // 本次送货数量
+  unitPriceMills  Int // 单价快照（厘）
+  amountCents     Int // 金额快照（分）
+  note            String? // 行备注快照
+
+  deliveryNote DeliveryNote @relation(fields: [noteId], references: [id], onDelete: Cascade)
+
+  @@index([noteId])
+  @@index([orderId])
+}
+
+// ==================== 对账单预设（P16：客户可绑定不同对账单格式） ====================
+
+model StatementTemplate {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique // 预设名（唯一）
+  title     String   @default("对账单") // 标题文字（如"对账单"/"销货清单"）
+  terms     String? // 条款/备注（账期/结算约定，显示在单据底部）
+  columns   String   @default("[]") // 列配置 JSON：[{key,label,visible,width?}]
+  isDefault Boolean  @default(false) // 是否默认预设（系统内置，禁删）
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customers Customer[]
+
+  @@index([isDefault])
+}
